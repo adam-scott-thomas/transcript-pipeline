@@ -99,6 +99,25 @@ def _build_parser() -> argparse.ArgumentParser:
     wv.add_argument("--claude-export", type=Path, help="Claude.ai export .zip or conversations.json")
     wv.add_argument("--lane", default="uncapped", choices=["production", "archive", "uncapped"],
                     help="default uncapped — cross-session weaves can run very long")
+
+    # v0.4 — semantic filtering + per-window classification
+    wv.add_argument("--semantic-threshold", type=float, default=0.55,
+                    help="cosine threshold for semantic relevance (default 0.55)")
+    wv.add_argument("--top-k", type=int, default=None,
+                    help="if set, keep only the K most-similar streams instead of using threshold")
+    wv.add_argument("--no-semantic", action="store_true",
+                    help="bypass semantic filter — time-only weave (v0.3 behavior)")
+    wv.add_argument("--window-tokens", type=int, default=2500,
+                    help="token window size for embeddings (default 2500)")
+    wv.add_argument("--window-overlap", type=float, default=0.5,
+                    help="window overlap fraction (default 0.5)")
+    wv.add_argument("--embedder-model", default="qwen3-embedding:8b")
+    wv.add_argument("--classify", action="store_true", default=True,
+                    help="per-window stage labels (default on)")
+    wv.add_argument("--no-classify", action="store_false", dest="classify")
+    wv.add_argument("--classifier-model", default="qwen3:8b")
+    wv.add_argument("--confidence-threshold", type=float, default=0.7,
+                    help="below this, label.requires_human=True (default 0.7)")
     wv.add_argument("--window-hours", type=float, default=2.0,
                     help="±hours around anchor span to pull others (default 2)")
     wv.add_argument("--project", default="GL")
@@ -336,7 +355,7 @@ def _cmd_weave(args) -> int:
     from transcript_pipeline.embedder import EmbedRequest, embed
     from transcript_pipeline.html_renderer import render_html_to_file
     from transcript_pipeline.schema import Stage, Status
-    from transcript_pipeline.temporal_weaver import weave
+    from transcript_pipeline.temporal_weaver import SemanticConfig, weave
 
     core = get_core()
     out_dir: Path = core.get("path.out_dir")
@@ -361,13 +380,62 @@ def _cmd_weave(args) -> int:
         others.extend(cw_streams)
 
     window_seconds = args.window_hours * 3600.0
-    result = weave(anchor, others, window_seconds=window_seconds)
+    semantic = SemanticConfig(
+        enabled=not args.no_semantic,
+        out_dir=out_dir,
+        embedder_tag=args.embedder_model,
+        window_tokens=args.window_tokens,
+        window_overlap=args.window_overlap,
+        threshold=args.semantic_threshold,
+        top_k=args.top_k,
+    )
+    if semantic.enabled:
+        print(
+            f"semantic filter: threshold={semantic.threshold} top_k={semantic.top_k} "
+            f"embedder={semantic.embedder_tag} windows={semantic.window_tokens}t/{semantic.window_overlap:.0%}"
+        )
+    result = weave(anchor, others, window_seconds=window_seconds, semantic=semantic)
     print(
         f"woven: {len(result.merged)} turns from "
         f"{len(result.included)} stream(s) within ±{args.window_hours}h"
     )
     for ag, cid in result.included:
-        print(f"  · {ag} {cid[:18]}…")
+        print(f"  · INCLUDED  {ag} {cid[:18]}…")
+    for ag, cid, sim in result.dropped_semantic:
+        print(f"  · DROPPED   {ag} {cid[:18]}… (sim={sim:.3f})")
+
+    # ── v0.4 — per-window classification on the woven content ──
+    if args.classify and not args.no_semantic:
+        from transcript_pipeline.embeddings import (
+            DEFAULT_WINDOW_TOKENS,
+            compute_embeddings,
+            save_cache,
+            stream_text,
+            windowize,
+        )
+        from transcript_pipeline.window_classifier import classify_windows
+
+        print(
+            f"classifying woven content with {args.classifier_model} "
+            f"(confidence threshold {args.confidence_threshold})"
+        )
+        woven_text = stream_text(result.merged)
+        windows = windowize(
+            woven_text,
+            window_tokens=args.window_tokens,
+            overlap=args.window_overlap,
+        )
+        labels = classify_windows(
+            windows,
+            model=args.classifier_model,
+            confidence_threshold=args.confidence_threshold,
+            progress=True,
+        )
+        n_human = sum(1 for l in labels if l.requires_human)
+        print(
+            f"classified: {len(labels)} windows, "
+            f"{n_human} flagged for human review (<{args.confidence_threshold} confidence)"
+        )
 
     # Every woven turn defaults to stage=Context (single-chapter archive view).
     # Future iteration: classify with OllamaClient when Ollama is up.
