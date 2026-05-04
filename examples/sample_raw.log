@@ -1,0 +1,22 @@
+[ADAM | HUMAN | Context]
+Fix the auth flow.
+
+[GPT | STRATEGY | Problem]
+[REF: GL-002]
+Root issue is stale key reuse. Single source of truth is missing.
+
+[CLAUDE | REASONING | Decision]
+Define one canonical auth flow. All clients must read/write from same path.
+
+[CLAUDE-CODE | IMPLEMENTATION | Build]
+Updating localStorage handling. Adding key validation + fallback path.
+
+[CODEX | CODE-REVIEW | Review]
+LGTM. Suggest renaming `_authKey` to `_authToken` for clarity.
+
+[CLAUDE-CODE | IMPLEMENTATION | Fix]
+Removed stale key cache. Tests green.
+
+[ADAM | HUMAN | Ship]
+[STATUS: SHIPPED]
+Ship it.
