@@ -60,6 +60,26 @@ def _build_parser() -> argparse.ArgumentParser:
     ing.add_argument("--resumed", action="store_true")
     ing.add_argument("--out", type=Path, help="output path (default: out_dir/<code>/embedded.yml)")
 
+    # v0.2 — classifier flags
+    ing.add_argument(
+        "--classify",
+        choices=["off", "interactive", "auto", "dry-run", "mock"],
+        default="off",
+        help=(
+            "off: requires explicit [STAGE: ...] tags (v0.1 behavior). "
+            "interactive: every turn confirmed. "
+            "auto: silent above --auto-confirm-above, surface the rest. "
+            "dry-run: classify but don't apply (logs only). "
+            "mock: deterministic stub classifier (no API keys required)."
+        ),
+    )
+    ing.add_argument(
+        "--auto-confirm-above",
+        type=float,
+        default=0.9,
+        help="confidence threshold for auto-apply in --classify auto (default 0.9)",
+    )
+
     val = sub.add_parser("validate", help="check embedded file against spec v1.0")
     val.add_argument("embedded", type=Path)
 
@@ -87,6 +107,10 @@ def _cmd_ingest(args) -> int:
     raw = Path(args.raw_log).read_text(encoding="utf-8")
     parsed = parse_log(raw)
 
+    # v0.2 — classifier
+    if args.classify != "off":
+        parsed = _run_classifier(parsed, args.classify, args.auto_confirm_above, core)
+
     req = EmbedRequest(
         project=args.project,
         project_number=args.number,
@@ -101,6 +125,82 @@ def _cmd_ingest(args) -> int:
     written = embed_to_file(req, parsed, out_path)
     print(f"wrote {written}")
     return 0
+
+
+def _run_classifier(parsed, mode_flag, auto_threshold, core):
+    """Apply two-model classification + confirmation gate. Mutates parsed
+    turns to set stage / chapter from confirmed proposals. Skipped/quit
+    turns leave whatever the parser captured (caller's problem)."""
+    from transcript_pipeline.classifier import (
+        AnthropicSonnetClient,
+        CostRecord,
+        Disagreement,
+        MockClient,
+        OpenAIGPTClient,
+        classify_turns,
+        summarize,
+    )
+    from transcript_pipeline.confirm import ConfirmMode, confirm
+    from transcript_pipeline.diagnostics import (
+        append_confirmations,
+        append_costs,
+        append_disagreements,
+        estimate_cost_usd,
+    )
+
+    if mode_flag == "mock":
+        primary = MockClient()
+        auditor = MockClient()
+        gate_mode = ConfirmMode.AUTO
+    elif mode_flag == "dry-run":
+        primary = MockClient()
+        auditor = MockClient()
+        gate_mode = ConfirmMode.DRY_RUN
+    else:
+        primary = AnthropicSonnetClient()
+        auditor = OpenAIGPTClient()
+        gate_mode = ConfirmMode.INTERACTIVE if mode_flag == "interactive" else ConfirmMode.AUTO
+
+    cost_sink: list[CostRecord] = []
+    dis_sink: list[Disagreement] = []
+    proposals = classify_turns(parsed, primary, auditor, cost_sink=cost_sink, disagreement_sink=dis_sink)
+
+    bodies = [pt.body for pt in parsed]
+    final, confirmations = confirm(
+        proposals,
+        bodies,
+        mode=gate_mode,
+        auto_confirm_above=auto_threshold,
+    )
+
+    # apply final proposals onto parsed turns
+    by_turn = {p.turn_index: p for p in final}
+    for pt in parsed:
+        prop = by_turn.get(pt.turn)
+        if prop is None:
+            continue  # skipped or quit
+        if pt.stage is None:
+            pt.stage = prop.stage_proposed
+        if pt.chapter is None:
+            pt.chapter = prop.chapter_proposed
+
+    # persist diagnostics
+    out_dir: Path = core.get("path.out_dir")
+    if dis_sink:
+        append_disagreements(out_dir, dis_sink)
+    if cost_sink:
+        append_costs(out_dir, cost_sink)
+    if confirmations:
+        append_confirmations(out_dir, confirmations)
+
+    stats = summarize(proposals)
+    cost = estimate_cost_usd(cost_sink)
+    print(
+        f"classifier: total={stats.total} auto={stats.auto_apply} "
+        f"spot={stats.spot_check} human={stats.human_required} "
+        f"disagree={stats.disagreements} est_cost=${cost:.4f}"
+    )
+    return parsed
 
 
 def _cmd_validate(args) -> int:
