@@ -97,7 +97,8 @@ def _build_parser() -> argparse.ArgumentParser:
     wv.add_argument("--anchor", type=Path, required=True, help="path to a CC session JSONL")
     wv.add_argument("--gpt-export", type=Path, help="OpenAI export dir or conversations.json")
     wv.add_argument("--claude-export", type=Path, help="Claude.ai export .zip or conversations.json")
-    wv.add_argument("--lane", default="archive", choices=["production", "archive", "uncapped"])
+    wv.add_argument("--lane", default="uncapped", choices=["production", "archive", "uncapped"],
+                    help="default uncapped — cross-session weaves can run very long")
     wv.add_argument("--window-hours", type=float, default=2.0,
                     help="±hours around anchor span to pull others (default 2)")
     wv.add_argument("--project", default="GL")

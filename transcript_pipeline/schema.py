@@ -115,8 +115,8 @@ ALLOWED_PROJECT_CODES: tuple[str, ...] = ("GL", "MS", "POAW", "EVX", "ARC", "ARB
 # validator parameterizes on `lane` so it can apply the right cap.
 TURN_CAPS: dict[str, int | None] = {
     "production": 12,   # spec section 6 — fresh content, video pacing
-    "archive": 200,     # woven historical chats — read-friendly, longer
-    "uncapped": None,   # disable the check entirely (research / debug)
+    "archive": 1000,    # woven historical chats — read-friendly, can run long
+    "uncapped": None,   # disable the check entirely (cross-session weaves)
 }
 DEFAULT_LANE: str = "production"
 
