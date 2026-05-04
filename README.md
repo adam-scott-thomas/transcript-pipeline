@@ -36,6 +36,30 @@ transcript render   path/to/embedded.yml        # → transcript.txt + chapters.
 transcript batch    path/to/dir/                # 8-10 files in one pass
 ```
 
+### v0.2: stage classifier
+
+If your raw log is missing explicit `[STAGE: ...]` tags, the classifier
+proposes them via a two-model cross-check (Sonnet drafts, GPT-5 audits)
+with confirmation gate:
+
+```bash
+# every turn confirmed (high-touch)
+transcript ingest raw.log ... --classify interactive
+
+# silently apply when confidence ≥ 0.9 AND models agree; surface the rest
+transcript ingest raw.log ... --classify auto --auto-confirm-above 0.9
+
+# offline — deterministic stub, no API keys, ideal for CI tests
+transcript ingest raw.log ... --classify mock
+```
+
+Diagnostics (under `TRANSCRIPT_OUT_DIR/`):
+
+- `classifier-disagreements.jsonl` — every primary/auditor mismatch, for
+  prompt iteration
+- `classifier-cost.jsonl` — token usage per call; daily budget target $2
+- `classifier-confirmations.jsonl` — what humans accepted/overrode/skipped
+
 ## MCP
 
 ```bash
