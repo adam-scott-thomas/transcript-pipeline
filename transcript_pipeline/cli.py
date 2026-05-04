@@ -89,6 +89,23 @@ def _build_parser() -> argparse.ArgumentParser:
     bat = sub.add_parser("batch", help="validate+render every .yml in a directory")
     bat.add_argument("dir", type=Path)
 
+    # v0.3 — temporal weave: anchor CC session + GPT + Spidey-Claude
+    wv = sub.add_parser(
+        "weave",
+        help="anchor CC session + other chats happening at the same time → woven HTML",
+    )
+    wv.add_argument("--anchor", type=Path, required=True, help="path to a CC session JSONL")
+    wv.add_argument("--gpt-export", type=Path, help="OpenAI export dir or conversations.json")
+    wv.add_argument("--claude-export", type=Path, help="Claude.ai export .zip or conversations.json")
+    wv.add_argument("--lane", default="archive", choices=["production", "archive", "uncapped"])
+    wv.add_argument("--window-hours", type=float, default=2.0,
+                    help="±hours around anchor span to pull others (default 2)")
+    wv.add_argument("--project", default="GL")
+    wv.add_argument("--number", type=int, required=True)
+    wv.add_argument("--status", default="Field Notes")
+    wv.add_argument("--outcome", default="Cross-AI Session")
+    wv.add_argument("--out", type=Path, help="HTML output (default: out_dir/skool/<sessionId>.html)")
+
     return p
 
 
@@ -289,6 +306,13 @@ def _cmd_batch(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows defaults to cp1252 stdout; force UTF-8 so unicode in
+    # transcripts and rendered output doesn't crash the print path.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
     args = _build_parser().parse_args(argv)
     boot()
     handler = {
@@ -296,8 +320,97 @@ def main(argv: list[str] | None = None) -> int:
         "validate": _cmd_validate,
         "render": _cmd_render,
         "batch": _cmd_batch,
+        "weave": _cmd_weave,
     }[args.cmd]
     return handler(args)
+
+
+def _cmd_weave(args) -> int:
+    """v0.3 — anchor CC session + overlapping GPT + Spidey-Claude → woven HTML."""
+    from transcript_pipeline.adapters import (
+        load_cc_jsonl,
+        load_gpt_export,
+        load_claude_web_export,
+    )
+    from transcript_pipeline.embedder import EmbedRequest, embed
+    from transcript_pipeline.html_renderer import render_html_to_file
+    from transcript_pipeline.schema import Stage, Status
+    from transcript_pipeline.temporal_weaver import weave
+
+    core = get_core()
+    out_dir: Path = core.get("path.out_dir")
+
+    print(f"loading anchor: {args.anchor}")
+    anchor = load_cc_jsonl(Path(args.anchor))
+    if not anchor.turns:
+        print(f"anchor session has no turns; aborting", file=sys.stderr)
+        return 1
+    print(f"  anchor: {len(anchor.turns)} turns, {anchor.started_at} → {anchor.ended_at}")
+
+    others: list = []
+    if args.gpt_export:
+        print(f"loading GPT export: {args.gpt_export}")
+        gpt_streams = load_gpt_export(Path(args.gpt_export))
+        print(f"  GPT: {len(gpt_streams)} conversations")
+        others.extend(gpt_streams)
+    if args.claude_export:
+        print(f"loading Claude.ai export: {args.claude_export}")
+        cw_streams = load_claude_web_export(Path(args.claude_export))
+        print(f"  Claude.ai: {len(cw_streams)} conversations")
+        others.extend(cw_streams)
+
+    window_seconds = args.window_hours * 3600.0
+    result = weave(anchor, others, window_seconds=window_seconds)
+    print(
+        f"woven: {len(result.merged)} turns from "
+        f"{len(result.included)} stream(s) within ±{args.window_hours}h"
+    )
+    for ag, cid in result.included:
+        print(f"  · {ag} {cid[:18]}…")
+
+    # Every woven turn defaults to stage=Context (single-chapter archive view).
+    # Future iteration: classify with OllamaClient when Ollama is up.
+    for pt in result.merged:
+        if pt.stage is None:
+            pt.stage = Stage.CONTEXT
+        if pt.chapter is None:
+            pt.chapter = 1
+        if pt.chapter_outcome is None:
+            pt.chapter_outcome = "Session"
+
+    req = EmbedRequest(
+        project=args.project,
+        project_number=args.number,
+        status=Status(args.status),
+        outcome=args.outcome,
+        session_id=anchor.conversation_id,
+    )
+    transcript = embed(req, result.merged)
+
+    # validator (archive lane)
+    bus = core.get("diagnostics.bus")
+    bus.clear()
+    validator = core.get("capability.validator")
+    diagnostics = validator(transcript, lane=args.lane)
+    errors = [d for d in diagnostics if d.severity == "error"]
+    if errors:
+        print(f"\nvalidation errors:")
+        for d in errors:
+            print(f"  {d}")
+        return 1
+
+    out_path = (
+        Path(args.out)
+        if args.out
+        else out_dir / "skool" / f"{anchor.conversation_id}.html"
+    )
+    render_html_to_file(transcript, out_path)
+    print(f"\nwrote {out_path}")
+    print(
+        f"REMINDER: per the never-publish-without-scan rule, run scan-cast.mjs "
+        f"+ visual review BEFORE pasting into Skool."
+    )
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
