@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://env.ghostlogic.tech/schemas/v0/manifest.schema.json
+# envmanifest contract for transcript-pipeline. Lists every env var the runtime reads.
+version: 0
+compatibility: experimental
+project: transcript-pipeline
+
+environments: [local, ci, production]
+
+policies:
+  scanner:
+    fail_on_dynamic: false
+    languages: [python]
+  mcp:
+    redaction: partial
+    expose:
+      names: true
+      provider_metadata: true
+      values: false
+
+resources:
+  - name: TRANSCRIPT_OUT_DIR
+    kind: env
+    type: string
+    exposure: server
+    phase: [runtime]
+    environments: [local, ci, production]
+    description: "Directory for embedded YAML files and rendered output. Defaults to ./out."
+    required: false
+    default: "./out"
+
+  - name: TRANSCRIPT_LOG_LEVEL
+    kind: env
+    type: enum
+    values: [debug, info, warn, error]
+    exposure: server
+    phase: [runtime]
+    environments: [local, ci, production]
+    description: "Spine observer log level. info by default."
+    required: false
+    default: info
+
+  - name: TRANSCRIPT_FAIL_ON_WARN
+    kind: env
+    type: string
+    exposure: server
+    phase: [runtime]
+    environments: [ci]
+    description: "If '1', validator warnings (e.g. chapter count outside 3-8) become non-zero CLI exit. Used in CI."
+    required: false
+    default: "0"
