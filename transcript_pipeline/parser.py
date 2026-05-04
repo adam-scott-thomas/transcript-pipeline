@@ -84,7 +84,14 @@ _DIRECTIVE_RE = re.compile(
 
 @dataclass
 class ParsedTurn:
-    """Output of the parser. The embedder converts these to Turn objects."""
+    """Output of the parser. The embedder converts these to Turn objects.
+
+    `timestamp` and `conversation_id` are populated by the format adapters
+    (cc_jsonl/gpt/claude_web), not by this hand-rolled tag-header parser.
+    They flow through to the temporal weaver which uses them to merge
+    streams. `instance` is set by the weaver when it spots multiple
+    conversations of the same agent class — first seen = 1, second = 2,
+    etc."""
 
     turn: int
     agent: Agent
@@ -96,6 +103,9 @@ class ParsedTurn:
     status_tag: StatusTag | None = None
     references: list[str] = field(default_factory=list)
     visual: Visual | None = None
+    instance: int = 1
+    timestamp: float | None = None
+    conversation_id: str | None = None
 
 
 # ---------------------------------------------------------------------------

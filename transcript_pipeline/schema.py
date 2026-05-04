@@ -109,8 +109,24 @@ AGENT_DEFAULT_VISUAL: dict[Agent, Visual] = {
 # Closed set is documented but not enforced (Adam coins codes regularly).
 ALLOWED_PROJECT_CODES: tuple[str, ...] = ("GL", "MS", "POAW", "EVX", "ARC", "ARB")
 
-# Hard cap from spec section 6.
-MAX_TURNS_PER_VIDEO: int = 12
+# Per-lane turn caps. The spec's hard cap (12) is for hand-edited fresh
+# production videos; archive material (woven from existing chat history)
+# isn't pace-constrained the same way and is allowed to run long. The
+# validator parameterizes on `lane` so it can apply the right cap.
+TURN_CAPS: dict[str, int | None] = {
+    "production": 12,   # spec section 6 — fresh content, video pacing
+    "archive": 200,     # woven historical chats — read-friendly, longer
+    "uncapped": None,   # disable the check entirely (research / debug)
+}
+DEFAULT_LANE: str = "production"
+
+# Backwards-compat alias used by tests + older callers.
+MAX_TURNS_PER_VIDEO: int = TURN_CAPS[DEFAULT_LANE]
+
+
+def turn_cap(lane: str = DEFAULT_LANE) -> int | None:
+    """Return the turn cap for a lane, or None if uncapped."""
+    return TURN_CAPS.get(lane, TURN_CAPS[DEFAULT_LANE])
 
 # Chapter count guidance from spec section 2 (warning band, not error).
 CHAPTER_MIN: int = 3
@@ -174,7 +190,22 @@ class VideoHeader:
 
 @dataclass(frozen=True)
 class Turn:
-    """One message in the transcript."""
+    """One message in the transcript.
+
+    `instance` disambiguates multiple parallel conversations of the same
+    agent class. When Adam was talking to two Claude Code sessions
+    simultaneously, the temporal weaver assigns instance=1 to the first
+    seen and instance=2 to the second. The HTML renderer uses this to draw
+    progressively heavier outlines (none, white, double white) so a viewer
+    can tell which channel a bubble belongs to.
+
+    `timestamp` is wall-clock when the message was sent, used by the
+    temporal weaver to merge multiple streams. Optional because hand-edited
+    fresh transcripts don't need it.
+
+    `conversation_id` carries the source conversation (CC session, GPT
+    chat, claude.ai project). Used purely for tracing — humans don't see
+    it in the rendered output."""
 
     turn: int
     agent: Agent
@@ -186,6 +217,9 @@ class Turn:
     status_tag: StatusTag | None = None
     references: tuple[str, ...] = field(default_factory=tuple)
     visual: Visual | None = None  # falls back to AGENT_DEFAULT_VISUAL
+    instance: int = 1
+    timestamp: float | None = None  # epoch seconds
+    conversation_id: str | None = None
 
     @property
     def effective_visual(self) -> Visual:
@@ -194,7 +228,7 @@ class Turn:
         return AGENT_DEFAULT_VISUAL[self.agent]
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "turn": self.turn,
             "agent": self.agent.value,
             "role": self.role,
@@ -204,7 +238,13 @@ class Turn:
             "status_tag": self.status_tag.value if self.status_tag else None,
             "references": list(self.references),
             "visual": self.effective_visual.value,
+            "instance": self.instance,
         }
+        if self.timestamp is not None:
+            d["timestamp"] = self.timestamp
+        if self.conversation_id is not None:
+            d["conversation_id"] = self.conversation_id
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any], body: str) -> "Turn":
@@ -221,6 +261,9 @@ class Turn:
             status_tag=StatusTag(st) if st else None,
             references=tuple(d.get("references") or []),
             visual=Visual(vis) if vis else None,
+            instance=int(d.get("instance", 1)),
+            timestamp=d.get("timestamp"),
+            conversation_id=d.get("conversation_id"),
         )
 
 

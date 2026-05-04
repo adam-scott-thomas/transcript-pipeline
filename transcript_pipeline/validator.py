@@ -28,6 +28,7 @@ from transcript_pipeline.runtime import Diagnostic, emit
 from transcript_pipeline.schema import (
     CHAPTER_MAX,
     CHAPTER_MIN,
+    DEFAULT_LANE,
     MAX_TURNS_PER_VIDEO,
     OUTCOME_MAX_WORDS,
     REF_PATTERN,
@@ -35,6 +36,7 @@ from transcript_pipeline.schema import (
     Status,
     StatusTag,
     Transcript,
+    turn_cap,
 )
 
 
@@ -53,8 +55,11 @@ _TAG_COMPATIBILITY: dict[StatusTag, set[Status]] = {
 }
 
 
-def validate_transcript(t: Transcript) -> list[Diagnostic]:
-    """Run every check, emit diagnostics, return them."""
+def validate_transcript(t: Transcript, lane: str = DEFAULT_LANE) -> list[Diagnostic]:
+    """Run every check, emit diagnostics, return them.
+
+    `lane` selects the turn cap: 'production' (12), 'archive' (200),
+    'uncapped' (no check). Defaults to production."""
     findings: list[Diagnostic] = []
 
     def add(severity: str, code: str, message: str, location: str | None = None) -> None:
@@ -64,7 +69,7 @@ def validate_transcript(t: Transcript) -> list[Diagnostic]:
 
     _check_outcome_length(t, add)
     _check_resumed_consistency(t, add)
-    _check_turn_cap(t, add)
+    _check_turn_cap(t, add, lane=lane)
     _check_stages(t, add)
     _check_status_tags(t, add)
     _check_references(t, add)
@@ -114,23 +119,25 @@ def _check_resumed_consistency(
                 )
 
 
-def _check_turn_cap(t: Transcript, add) -> None:
+def _check_turn_cap(t: Transcript, add, lane: str = DEFAULT_LANE) -> None:
+    cap = turn_cap(lane)
+    if cap is None:
+        return  # uncapped lane skips this check entirely
     for turn in t.turns:
-        if turn.turn > MAX_TURNS_PER_VIDEO:
+        if turn.turn > cap:
             add(
                 "error",
                 "turn_cap_exceeded",
-                f"turn #{turn.turn} exceeds hard cap of "
-                f"{MAX_TURNS_PER_VIDEO}; split into Part 2 (e.g. {t.header.code} → "
+                f"turn #{turn.turn} exceeds {lane}-lane cap of "
+                f"{cap}; split into Part 2 (e.g. {t.header.code} → "
                 f"{t.header.project}-{t.header.project_number + 1:03d})",
                 location=f"turns[{turn.turn - 1}]",
             )
-    if len(t.turns) > MAX_TURNS_PER_VIDEO:
+    if len(t.turns) > cap:
         add(
             "error",
             "turn_cap_exceeded",
-            f"transcript has {len(t.turns)} turns; max per video is "
-            f"{MAX_TURNS_PER_VIDEO}",
+            f"transcript has {len(t.turns)} turns; {lane}-lane cap is {cap}",
         )
 
 

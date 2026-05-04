@@ -150,6 +150,9 @@ def embed(
             status_tag=pt.status_tag,
             references=tuple(pt.references),
             visual=pt.visual,
+            instance=getattr(pt, "instance", 1),
+            timestamp=getattr(pt, "timestamp", None),
+            conversation_id=getattr(pt, "conversation_id", None),
         )
         for pt in parsed
     ]
