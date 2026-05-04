@@ -48,3 +48,24 @@ resources:
     description: "If '1', validator warnings (e.g. chapter count outside 3-8) become non-zero CLI exit. Used in CI."
     required: false
     default: "0"
+
+  # v0.2 — classifier
+  - name: ANTHROPIC_API_KEY
+    kind: secret
+    type: string
+    exposure: server
+    phase: [runtime]
+    environments: [local, production]
+    description: "Anthropic API key. Required only when --classify is interactive|auto (Sonnet primary)."
+    pattern: "^sk-ant-"
+    required: false
+
+  - name: OPENAI_API_KEY
+    kind: secret
+    type: string
+    exposure: server
+    phase: [runtime]
+    environments: [local, production]
+    description: "OpenAI API key. Required only when --classify is interactive|auto (GPT-5 auditor)."
+    pattern: "^sk-"
+    required: false
