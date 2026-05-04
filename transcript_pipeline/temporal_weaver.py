@@ -51,6 +51,17 @@ class SemanticConfig:
                of off-topic candidates)
       stage 2: window-level max cosine on survivors only
 
+    v0.4.1 adds stage-aligned filtering: when `align_on_stage` is set,
+    stage 2 cosine is computed only over windows where BOTH the anchor
+    and the candidate carry that stage label. This is the "ghostlogic
+    Audit aligned across CC + claude.ai but not Build" query — it gates
+    on stage labels before cosine, which is cheaper AND more precise
+    than pure semantic (two Audit windows match harder than Audit-vs-
+    Build even when surface vocab overlaps).
+
+    Setting `align_on_stage` requires `classifier_tag` (need labels to
+    gate on); the CLI validates this.
+
     Defaults match the spec: qwen3-embedding:8b, 2500-token windows,
     50% overlap, cosine threshold 0.55. Pass `enabled=False` to bypass
     semantic filtering entirely (time-only weave, v0.3 behavior)."""
@@ -58,10 +69,13 @@ class SemanticConfig:
     enabled: bool = False
     out_dir: Path | None = None
     embedder_tag: str = "qwen3-embedding:8b"
+    classifier_tag: str | None = None  # if set, per-stream labels are computed
+    confidence_threshold: float = 0.7
     window_tokens: int = 2500
     window_overlap: float = 0.5
     threshold: float = 0.55
     top_k: int | None = None  # if set, overrides threshold
+    align_on_stage: str | None = None  # v0.4.1 — gate stage-2 by stage label
 
 
 @dataclass
@@ -75,10 +89,13 @@ class WeaveResult:
     included: list[tuple[str, str]]  # (agent_class, conversation_id)
     window: tuple[float, float]      # epoch range used for inclusion
     dropped_semantic: list[tuple[str, str, float]] = None  # (agent, convo_id, similarity)
+    low_confidence_alignments: list[tuple[str, str]] = None  # (agent, convo_id)
 
     def __post_init__(self):
         if self.dropped_semantic is None:
             self.dropped_semantic = []
+        if self.low_confidence_alignments is None:
+            self.low_confidence_alignments = []
 
 
 def weave(
@@ -105,6 +122,7 @@ def weave(
 
     pool: list[ParsedTurn] = []
     dropped_semantic: list[tuple[str, str, float]] = []
+    low_confidence_alignments: list[tuple[str, str]] = []
 
     # anchor turns always included
     pool.extend(_clone_with_id(anchor.turns, anchor.conversation_id))
@@ -112,15 +130,31 @@ def weave(
     # ── compute anchor embeddings if semantic is on ──
     anchor_emb = None
     if semantic and semantic.enabled and semantic.out_dir is not None:
-        from transcript_pipeline.embeddings import compute_embeddings, max_cosine
-        anchor_emb = compute_embeddings(
-            anchor.conversation_id,
-            anchor.turns,
-            out_dir=semantic.out_dir,
-            embedder_tag=semantic.embedder_tag,
-            window_tokens=semantic.window_tokens,
-            window_overlap=semantic.window_overlap,
+        from transcript_pipeline.embeddings import (
+            compute_embeddings,
+            compute_with_labels,
+            max_cosine,
         )
+        if semantic.classifier_tag:
+            anchor_emb = compute_with_labels(
+                anchor.conversation_id,
+                anchor.turns,
+                out_dir=semantic.out_dir,
+                embedder_tag=semantic.embedder_tag,
+                classifier_tag=semantic.classifier_tag,
+                window_tokens=semantic.window_tokens,
+                window_overlap=semantic.window_overlap,
+                confidence_threshold=semantic.confidence_threshold,
+            )
+        else:
+            anchor_emb = compute_embeddings(
+                anchor.conversation_id,
+                anchor.turns,
+                out_dir=semantic.out_dir,
+                embedder_tag=semantic.embedder_tag,
+                window_tokens=semantic.window_tokens,
+                window_overlap=semantic.window_overlap,
+            )
 
     # ── time-window filter, then optional semantic gate ──
     included: list[tuple[str, str]] = [
@@ -144,25 +178,59 @@ def weave(
 
         # ── semantic gate ──
         if semantic and semantic.enabled and anchor_emb is not None:
-            from transcript_pipeline.embeddings import compute_embeddings, max_cosine, _cosine
-            other_emb = compute_embeddings(
-                other.conversation_id,
-                other.turns,
-                out_dir=semantic.out_dir,
-                embedder_tag=semantic.embedder_tag,
-                window_tokens=semantic.window_tokens,
-                window_overlap=semantic.window_overlap,
+            from transcript_pipeline.embeddings import (
+                compute_embeddings,
+                compute_with_labels,
+                max_cosine,
+                _cosine,
             )
-            # stage 1: conversation-level cosine
+
+            # candidate embeddings (with labels if classifier is set)
+            if semantic.classifier_tag:
+                other_emb = compute_with_labels(
+                    other.conversation_id,
+                    other.turns,
+                    out_dir=semantic.out_dir,
+                    embedder_tag=semantic.embedder_tag,
+                    classifier_tag=semantic.classifier_tag,
+                    window_tokens=semantic.window_tokens,
+                    window_overlap=semantic.window_overlap,
+                    confidence_threshold=semantic.confidence_threshold,
+                )
+            else:
+                other_emb = compute_embeddings(
+                    other.conversation_id,
+                    other.turns,
+                    out_dir=semantic.out_dir,
+                    embedder_tag=semantic.embedder_tag,
+                    window_tokens=semantic.window_tokens,
+                    window_overlap=semantic.window_overlap,
+                )
+
+            # ── v0.4.1 — stage-aligned gate ──
+            if semantic.align_on_stage:
+                aligned_sim, low_conf = aligned_max_cosine(
+                    anchor_emb, other_emb, semantic.align_on_stage
+                )
+                if semantic.top_k is None and aligned_sim < semantic.threshold:
+                    dropped_semantic.append(
+                        (_agent_class(other.turns), other.conversation_id, aligned_sim)
+                    )
+                    continue
+                if low_conf:
+                    low_confidence_alignments.append(
+                        (_agent_class(other.turns), other.conversation_id)
+                    )
+                candidates_with_sims.append((other, sliced, aligned_sim))
+                continue
+
+            # ── default (v0.4) two-stage gate ──
             convo_sim = _cosine(anchor_emb.convo_vector, other_emb.convo_vector)
-            # stage 2 — only run if stage 1 passes (cheap pre-filter)
             if convo_sim < semantic.threshold * 0.85:
-                # well below threshold; don't waste cycles on window-level
                 dropped_semantic.append(
                     (_agent_class(other.turns), other.conversation_id, convo_sim)
                 )
                 continue
-            # stage 2: max window-level cosine to anchor's convo vector
             win_sim = max_cosine(anchor_emb.convo_vector, other_emb.window_vectors)
             best = max(convo_sim, win_sim)
             if semantic.top_k is None and best < semantic.threshold:
@@ -210,7 +278,59 @@ def weave(
         included=included,
         window=(win_start, win_end),
         dropped_semantic=dropped_semantic,
+        low_confidence_alignments=low_confidence_alignments,
     )
+
+
+def aligned_max_cosine(
+    anchor_emb,
+    candidate_emb,
+    target_stage: str,
+) -> tuple[float, bool]:
+    """v0.4.1 — max cosine over the cross-product of (anchor windows
+    labeled `target_stage`) × (candidate windows labeled `target_stage`).
+
+    Returns (max_similarity, has_low_confidence_label). The low-confidence
+    flag fires if any participating window has `requires_human=True`
+    (confidence < threshold). These windows still participate — surfacing
+    shaky alignments is the whole point of the threshold — but the
+    caller should annotate them as such per the spec.
+
+    Returns (0.0, False) if either side has no windows of that stage."""
+    import numpy as np
+
+    if not anchor_emb.labels or not candidate_emb.labels:
+        return 0.0, False
+
+    a_idxs = [
+        i for i, l in enumerate(anchor_emb.labels)
+        if l.stage == target_stage
+    ]
+    c_idxs = [
+        i for i, l in enumerate(candidate_emb.labels)
+        if l.stage == target_stage
+    ]
+    if not a_idxs or not c_idxs:
+        return 0.0, False
+
+    a_vecs = anchor_emb.window_vectors[a_idxs].astype(np.float32)
+    c_vecs = candidate_emb.window_vectors[c_idxs].astype(np.float32)
+
+    a_norms = np.linalg.norm(a_vecs, axis=1, keepdims=True)
+    c_norms = np.linalg.norm(c_vecs, axis=1, keepdims=True)
+    a_norms = np.where(a_norms == 0.0, 1.0, a_norms)
+    c_norms = np.where(c_norms == 0.0, 1.0, c_norms)
+
+    a_unit = a_vecs / a_norms
+    c_unit = c_vecs / c_norms
+    sims = a_unit @ c_unit.T  # (len(a_idxs), len(c_idxs))
+    max_sim = float(sims.max())
+
+    has_low_conf = (
+        any(anchor_emb.labels[i].requires_human for i in a_idxs)
+        or any(candidate_emb.labels[i].requires_human for i in c_idxs)
+    )
+    return max_sim, has_low_conf
 
 
 # ---------------------------------------------------------------------------
