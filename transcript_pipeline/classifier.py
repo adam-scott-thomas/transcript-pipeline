@@ -227,6 +227,66 @@ class AnthropicSonnetClient:
         )
 
 
+class OllamaClient:
+    """Local-LLM classifier via Ollama HTTP API. Default for the archive
+    lane — keeps the cloud API budget for fresh production work.
+
+    Talks to http://localhost:11434/api/generate with format='json'.
+    Defaults to qwen2.5:14b (Adam has it pulled per memory). Stage classification
+    is a 9-way labeled output with a tiny JSON response — easily within
+    a 7B+ model's reliable range."""
+
+    def __init__(
+        self,
+        model: str = "qwen2.5:14b",
+        host: str = "http://localhost:11434",
+        timeout_s: float = 120.0,
+    ):
+        import urllib.request
+
+        self.model = model
+        self.host = host.rstrip("/")
+        self.timeout_s = timeout_s
+        self._urllib = urllib.request
+
+    def classify(self, payload: ClassifyInput) -> ClassifyOutput:
+        return self._call(STAGE_CLASSIFIER_SYSTEM, _format_user(payload))
+
+    def audit(self, payload: ClassifyInput, primary: ClassifyOutput) -> ClassifyOutput:
+        return self._call(AUDITOR_SYSTEM, _format_auditor_user(payload, primary))
+
+    def _call(self, system: str, user: str) -> ClassifyOutput:
+        import json as _json
+
+        body = _json.dumps(
+            {
+                "model": self.model,
+                "system": system,
+                "prompt": user,
+                "format": "json",
+                "stream": False,
+                "options": {"temperature": 0.1, "num_predict": 200},
+            }
+        ).encode("utf-8")
+        req = self._urllib.Request(
+            f"{self.host}/api/generate",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with self._urllib.urlopen(req, timeout=self.timeout_s) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        raw = data.get("response", "")
+        stage, conf, reasoning = _parse_response(raw)
+        return ClassifyOutput(
+            stage=stage,
+            confidence=conf,
+            reasoning=reasoning,
+            raw_response=raw,
+            tokens_in=data.get("prompt_eval_count", 0),
+            tokens_out=data.get("eval_count", 0),
+        )
+
+
 class OpenAIGPTClient:
     """Auditor. GPT-5 (or gpt-5.2 per Adam's CLAUDE.md default)."""
 
