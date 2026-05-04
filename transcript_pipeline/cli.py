@@ -118,6 +118,17 @@ def _build_parser() -> argparse.ArgumentParser:
     wv.add_argument("--classifier-model", default="qwen3:8b")
     wv.add_argument("--confidence-threshold", type=float, default=0.7,
                     help="below this, label.requires_human=True (default 0.7)")
+    wv.add_argument(
+        "--align-on-stage",
+        choices=["Context", "Problem", "Audit", "Decision", "Build", "Fix", "Review", "Ship", "Next"],
+        default=None,
+        help=(
+            "v0.4.1 — gate stage-2 retrieval to candidate windows whose stage label "
+            "matches the anchor's at this stage. Requires --classify (need labels). "
+            "Example: --align-on-stage Audit answers 'what was I auditing across "
+            "CC + claude.ai during this anchor's audit phase?'"
+        ),
+    )
     wv.add_argument("--window-hours", type=float, default=2.0,
                     help="±hours around anchor span to pull others (default 2)")
     wv.add_argument("--project", default="GL")
@@ -346,7 +357,23 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _cmd_weave(args) -> int:
-    """v0.3 — anchor CC session + overlapping GPT + Spidey-Claude → woven HTML."""
+    """v0.3+ — anchor CC session + overlapping GPT + Spidey-Claude → woven HTML."""
+    # ── v0.4.1 — validate flag combinations BEFORE expensive loads ──
+    if args.align_on_stage and args.no_semantic:
+        print(
+            "--align-on-stage requires semantic filtering; "
+            "do not pass --no-semantic.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.align_on_stage and not args.classify:
+        print(
+            "--align-on-stage requires per-stream stage labels; "
+            "do not pass --no-classify.",
+            file=sys.stderr,
+        )
+        return 1
+
     from transcript_pipeline.adapters import (
         load_cc_jsonl,
         load_gpt_export,
@@ -380,27 +407,40 @@ def _cmd_weave(args) -> int:
         others.extend(cw_streams)
 
     window_seconds = args.window_hours * 3600.0
+
+    classifier_tag_for_streams = (
+        args.classifier_model if args.classify and not args.no_semantic else None
+    )
+
     semantic = SemanticConfig(
         enabled=not args.no_semantic,
         out_dir=out_dir,
         embedder_tag=args.embedder_model,
+        classifier_tag=classifier_tag_for_streams,
+        confidence_threshold=args.confidence_threshold,
         window_tokens=args.window_tokens,
         window_overlap=args.window_overlap,
         threshold=args.semantic_threshold,
         top_k=args.top_k,
+        align_on_stage=args.align_on_stage,
     )
     if semantic.enabled:
+        align_str = f" align-on={semantic.align_on_stage}" if semantic.align_on_stage else ""
+        cls_str = f" classifier={semantic.classifier_tag}" if semantic.classifier_tag else " classifier=off"
         print(
             f"semantic filter: threshold={semantic.threshold} top_k={semantic.top_k} "
             f"embedder={semantic.embedder_tag} windows={semantic.window_tokens}t/{semantic.window_overlap:.0%}"
+            f"{cls_str}{align_str}"
         )
     result = weave(anchor, others, window_seconds=window_seconds, semantic=semantic)
     print(
         f"woven: {len(result.merged)} turns from "
         f"{len(result.included)} stream(s) within ±{args.window_hours}h"
     )
+    low_conf_set = {cid for _, cid in result.low_confidence_alignments}
     for ag, cid in result.included:
-        print(f"  · INCLUDED  {ag} {cid[:18]}…")
+        flag = "  [low_confidence_alignment]" if cid in low_conf_set else ""
+        print(f"  · INCLUDED  {ag} {cid[:18]}…{flag}")
     for ag, cid, sim in result.dropped_semantic:
         print(f"  · DROPPED   {ag} {cid[:18]}… (sim={sim:.3f})")
 
