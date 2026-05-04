@@ -372,12 +372,17 @@ def compute_embeddings(
     embedder_tag: str = DEFAULT_EMBEDDER_TAG,
     window_tokens: int = DEFAULT_WINDOW_TOKENS,
     window_overlap: float = DEFAULT_WINDOW_OVERLAP,
+    classifier_tag: str | None = None,
     host: str = OLLAMA_HOST,
     force: bool = False,
 ) -> CachedEmbeddings:
     """Compute (or fetch from cache) the convo + window vectors for one
     stream's turns. Labels are NOT computed here — call classify_windows()
-    for those, then save_cache() to persist the combined result."""
+    for those, then save_cache() to persist the combined result.
+
+    `classifier_tag` is forwarded to load_cache so labels load too if the
+    cached classifier matches; otherwise labels come back empty and the
+    caller (e.g. compute_with_labels) re-runs classification."""
     if not force:
         cached = load_cache(
             out_dir,
@@ -385,6 +390,7 @@ def compute_embeddings(
             embedder_tag=embedder_tag,
             window_tokens=window_tokens,
             window_overlap=window_overlap,
+            classifier_tag=classifier_tag,
         )
         if cached is not None:
             return cached
@@ -409,3 +415,65 @@ def compute_embeddings(
         window_texts=windows,
         labels=[],
     )
+
+
+def compute_with_labels(
+    convo_id: str,
+    turns,
+    *,
+    out_dir: Path,
+    embedder_tag: str = DEFAULT_EMBEDDER_TAG,
+    classifier_tag: str = DEFAULT_CLASSIFIER_TAG,
+    window_tokens: int = DEFAULT_WINDOW_TOKENS,
+    window_overlap: float = DEFAULT_WINDOW_OVERLAP,
+    confidence_threshold: float = 0.7,
+    host: str = OLLAMA_HOST,
+    force: bool = False,
+    progress: bool = False,
+) -> CachedEmbeddings:
+    """v0.4.1 — compute embeddings AND per-window stage labels for one
+    stream. Persists the combined result.
+
+    Honors v0.4 cache invalidation:
+      - embedder/window-params change → full re-embed + re-classify
+      - classifier_tag change ONLY → embeddings load from cache, only
+        labels re-run. Independent invalidation.
+      - everything matches → returns cache, zero LLM calls
+
+    The `classifier_tag` propagates into compute_embeddings so its
+    load_cache call returns labels too when they match. If labels are
+    present in cache and match `classifier_tag`, this function is a
+    no-op LLM-wise."""
+    cached = compute_embeddings(
+        convo_id,
+        turns,
+        out_dir=out_dir,
+        embedder_tag=embedder_tag,
+        window_tokens=window_tokens,
+        window_overlap=window_overlap,
+        classifier_tag=classifier_tag,
+        host=host,
+        force=force,
+    )
+
+    needs_classify = (
+        not cached.has_labels()
+        or cached.classifier_tag != classifier_tag
+    )
+    if not needs_classify:
+        return cached
+
+    # late import: keeps embeddings.py free of qwen3-instruct prompts
+    from transcript_pipeline.window_classifier import classify_windows
+
+    labels = classify_windows(
+        cached.window_texts,
+        model=classifier_tag,
+        host=host,
+        confidence_threshold=confidence_threshold,
+        progress=progress,
+    )
+    cached.labels = labels
+    cached.classifier_tag = classifier_tag
+    save_cache(out_dir, cached)
+    return cached
