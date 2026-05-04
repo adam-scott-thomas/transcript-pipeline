@@ -1,0 +1,21 @@
+[ADAM | HUMAN]
+Goal: fix the broken auth flow this week.
+
+[GPT | STRATEGY]
+[REF: GL-002]
+Problem: stale key reuse. Single source of truth is missing.
+
+[CLAUDE | REASONING]
+Audit shows three clients writing to different keys.
+
+[CLAUDE-CODE | IMPLEMENTATION]
+Decision: single source of truth in shared storage adapter.
+
+[CLAUDE-CODE | IMPLEMENTATION]
+Implementing the new auth interceptor.
+
+[CODEX | CODE-REVIEW]
+LGTM, ship after staging soak.
+
+[ADAM | HUMAN]
+Shipped; demo recorded.
