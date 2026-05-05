@@ -173,33 +173,36 @@ def test_parse_segments_codex_handles_tool_lines():
 # ---------------------------------------------------------------------------
 
 
-def test_dwell_audit_prose_is_4000():
+def test_dwell_audit_prose_is_1000_v0_5_2():
+    """v0.5.2 fast pace: Audit/Review = 1000ms (was 4000)."""
     s = Segment(kind="prose", text="trace")
-    assert compute_dwell(s, stage="Audit", requires_human=False) == 4000
+    assert compute_dwell(s, stage="Audit", requires_human=False) == 1000
 
 
-def test_dwell_low_confidence_adds_500():
+def test_dwell_low_confidence_adds_400_v0_5_2():
+    """v0.5.2 fast pace: requires_human bonus = +400 (was +500)."""
     s = Segment(kind="prose", text="trace")
-    assert compute_dwell(s, stage="Audit", requires_human=True) == 4500
+    assert compute_dwell(s, stage="Audit", requires_human=True) == 1400
 
 
-def test_dwell_tool_call_is_40_percent():
+def test_dwell_tool_call_is_50_percent_v0_5_2():
+    """v0.5.2 fast pace: tool-call = 50% prose (was 40%)."""
     s = Segment(kind="tool-call", text="Bash mkdir")
-    # Audit base 4000 → 40% = 1600
-    assert compute_dwell(s, stage="Audit", requires_human=False) == 1600
+    # Decision base 1500 → 50% = 750
+    assert compute_dwell(s, stage="Decision", requires_human=False) == 750
 
 
-def test_dwell_code_output_is_30_percent():
+def test_dwell_code_output_is_35_percent_v0_5_2():
+    """v0.5.2 fast pace: code-output = 35% prose (was 30%)."""
     s = Segment(kind="code-output", text="ok")
-    # Build base 1500 → 30% = 450
-    assert compute_dwell(s, stage="Build", requires_human=False) == 450
+    # Decision base 1500 → 35% = 525
+    assert compute_dwell(s, stage="Decision", requires_human=False) == 525
 
 
 def test_dwell_minimum_is_400():
     s = Segment(kind="code-output", text="ok")
-    # Context base 1500 × 30% = 450 — already above min
-    # but for the smallest stage * min mult, e.g. context * 30% = 450, still ≥ 400
-    assert compute_dwell(s, stage="Context", requires_human=False) >= 400
+    # Context base 700 × 35% = 245 → floored to 400
+    assert compute_dwell(s, stage="Context", requires_human=False) == 400
 
 
 # ---------------------------------------------------------------------------
