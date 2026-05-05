@@ -83,8 +83,39 @@ def _build_parser() -> argparse.ArgumentParser:
     val = sub.add_parser("validate", help="check embedded file against spec v1.0")
     val.add_argument("embedded", type=Path)
 
-    rnd = sub.add_parser("render", help="embedded → transcript.txt + chapters.md + bubbles.json")
-    rnd.add_argument("embedded", type=Path)
+    rnd = sub.add_parser(
+        "render",
+        help="embedded → transcript.txt + chapters.md + bubbles.json (v0.1) "
+             "OR --woven → bubble HTML pages (v0.5)",
+    )
+    rnd.add_argument("embedded", type=Path, nargs="?",
+                     help="(v0.1) path to an embedded.yml file")
+
+    # v0.5 — bubble HTML page mode
+    rnd.add_argument("--woven", type=Path,
+                     help="(v0.5) path to a .woven.jsonl file (from `transcript weave`)")
+    rnd.add_argument("--project-code",
+                     help="(v0.5) e.g. GL-004 — must match ^[A-Z]+-\\d{3}$")
+    rnd.add_argument("--status",
+                     help="(v0.5) closed set: Shipped|Building|Incomplete|Blocked|"
+                          "Fixed|Audit|Reset|Field Notes")
+    rnd.add_argument("--outcome",
+                     help="(v0.5) 6 words max")
+    rnd.add_argument("--lane", default="production",
+                     choices=["production", "archive", "uncapped"])
+    rnd.add_argument("--out", type=Path,
+                     help="(v0.5) output stem WITHOUT extension; "
+                          "writes <stem>-part-NN.html")
+
+    # v0.6 — reserved (do not implement; refuse if used)
+    rnd.add_argument("--capture-mp4", action="store_true",
+                     help="(v0.6 — reserved, not yet implemented)")
+    rnd.add_argument("--fps", type=int,
+                     help="(v0.6 — reserved, not yet implemented)")
+    rnd.add_argument("--output-mp4", type=Path,
+                     help="(v0.6 — reserved, not yet implemented)")
+    rnd.add_argument("--part", type=int,
+                     help="(v0.6 — reserved, not yet implemented)")
 
     bat = sub.add_parser("batch", help="validate+render every .yml in a directory")
     bat.add_argument("dir", type=Path)
@@ -281,6 +312,29 @@ def _cmd_validate(args) -> int:
 
 
 def _cmd_render(args) -> int:
+    # ── v0.6 reserved-flag refusal ──
+    for flag in ("capture_mp4", "fps", "output_mp4", "part"):
+        if getattr(args, flag, None):
+            print(
+                f"--{flag.replace('_', '-')} is reserved for v0.6 (playwright "
+                f"scroll + ffmpeg capture); not yet implemented.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # ── v0.5 — bubble HTML mode ──
+    if args.woven:
+        return _cmd_render_skool(args)
+
+    # ── v0.1 — embedded.yml mode ──
+    if not args.embedded:
+        print(
+            "render: provide either a positional embedded.yml (v0.1) "
+            "or --woven <path> (v0.5).",
+            file=sys.stderr,
+        )
+        return 1
+
     from transcript_pipeline.embedder import load_embedded
 
     core = get_core()
@@ -293,6 +347,56 @@ def _cmd_render(args) -> int:
     print(f"transcript: {result.transcript_path}")
     print(f"chapters:   {result.chapters_path}")
     print(f"bubbles:    {result.bubbles_path}")
+    return 0
+
+
+def _cmd_render_skool(args) -> int:
+    """v0.5 — woven jsonl → bubble HTML page(s)."""
+    from transcript_pipeline.skool_renderer import RenderRequest, render_file
+
+    missing = [
+        name for name in ("project_code", "status", "outcome")
+        if not getattr(args, name, None)
+    ]
+    if missing:
+        print(
+            "render --woven requires: "
+            + ", ".join(f"--{m.replace('_', '-')}" for m in missing),
+            file=sys.stderr,
+        )
+        return 1
+
+    core = get_core()
+    out_dir: Path = core.get("path.out_dir")
+
+    if args.out:
+        out_stem = Path(args.out)
+    else:
+        # default: out_dir/skool/<stem-of-woven>
+        woven_stem = Path(args.woven).stem
+        if woven_stem.endswith(".woven"):
+            woven_stem = woven_stem[: -len(".woven")]
+        out_stem = out_dir / "skool" / woven_stem
+
+    request = RenderRequest(
+        project_code=args.project_code,
+        status=args.status,
+        outcome=args.outcome,
+        lane=args.lane,
+    )
+    try:
+        paths = render_file(Path(args.woven), request=request, out_stem=out_stem)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    for p in paths:
+        print(f"wrote {p}")
+    if len(paths) > 1:
+        print(f"  ({len(paths)} parts; lane={args.lane} cap split applied)")
+    print(
+        f"REMINDER: per the never-publish-without-scan rule, run scan-cast.mjs "
+        f"+ visual review BEFORE pasting into Skool."
+    )
     return 0
 
 
@@ -515,6 +619,20 @@ def _cmd_weave(args) -> int:
     )
     render_html_to_file(transcript, out_path)
     print(f"\nwrote {out_path}")
+
+    # ── v0.5 — also persist a woven.jsonl for the bubble renderer / mp4 layer ──
+    from transcript_pipeline.woven_jsonl import parsed_to_woven, write_woven
+    woven_jsonl_path = out_dir / "skool" / f"{anchor.conversation_id}.woven.jsonl"
+    woven_turns = parsed_to_woven(result.merged)
+    write_woven(
+        woven_jsonl_path,
+        session_id=anchor.conversation_id,
+        anchor_id=anchor.conversation_id,
+        started_at=anchor.started_at,
+        ended_at=anchor.ended_at,
+        turns=woven_turns,
+    )
+    print(f"wrote {woven_jsonl_path}  ({len(woven_turns)} turns)")
     print(
         f"REMINDER: per the never-publish-without-scan rule, run scan-cast.mjs "
         f"+ visual review BEFORE pasting into Skool."
