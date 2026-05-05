@@ -93,6 +93,17 @@ class WovenTurn:
     chapter: int = 1
     chapter_outcome: str = ""
 
+    # v0.5.2 — copy-paste carry annotation
+    # When ADAM pastes a prior AI bubble's content into another agent's chat,
+    # the carry detector tags this turn with is_carry=true so the renderer
+    # can suppress the duplicate. The source bubble's carried_to list grows
+    # by the agent class that received the paste.
+    is_carry: bool = False
+    carry_source: int | None = None       # turn number of the source bubble
+    carry_similarity: float | None = None  # cosine similarity at detection time
+    carried_to: list[str] = field(default_factory=list)  # agent classes that
+                                                          # received this bubble
+
     def to_obj(self) -> dict:
         return {
             "_kind": "turn",
@@ -110,6 +121,10 @@ class WovenTurn:
             "requires_human": self.requires_human,
             "chapter": self.chapter,
             "chapter_outcome": self.chapter_outcome,
+            "is_carry": self.is_carry,
+            "carry_source": self.carry_source,
+            "carry_similarity": self.carry_similarity,
+            "carried_to": list(self.carried_to),
         }
 
     @classmethod
@@ -129,6 +144,10 @@ class WovenTurn:
             requires_human=bool(d.get("requires_human", False)),
             chapter=int(d.get("chapter", 1)),
             chapter_outcome=str(d.get("chapter_outcome", "")),
+            is_carry=bool(d.get("is_carry", False)),
+            carry_source=d.get("carry_source"),
+            carry_similarity=d.get("carry_similarity"),
+            carried_to=list(d.get("carried_to") or []),
         )
 
 
