@@ -106,6 +106,13 @@ def _build_parser() -> argparse.ArgumentParser:
     rnd.add_argument("--out", type=Path,
                      help="(v0.5) output stem WITHOUT extension; "
                           "writes <stem>-part-NN.html")
+    rnd.add_argument(
+        "--pace", choices=["fast", "editorial"], default="fast",
+        help=(
+            "(v0.5.2) dwell pacing. fast = group-chat (default, only path "
+            "implemented). editorial = long-form, reserved for v0.5.3+."
+        ),
+    )
 
     # v0.6 — reserved (do not implement; refuse if used)
     rnd.add_argument("--capture-mp4", action="store_true",
@@ -159,6 +166,21 @@ def _build_parser() -> argparse.ArgumentParser:
             "Example: --align-on-stage Audit answers 'what was I auditing across "
             "CC + claude.ai during this anchor's audit phase?'"
         ),
+    )
+
+    # v0.5.2 — copy-paste carry detection
+    wv.add_argument(
+        "--carry-threshold", type=float, default=0.85,
+        help=(
+            "v0.5.2 — cosine threshold for tagging an ADAM bubble as a "
+            "copy-paste of a prior AI bubble. Default 0.85; the carried "
+            "ADAM bubble is suppressed in render and the source bubble "
+            "shows a thumbs-up indicator."
+        ),
+    )
+    wv.add_argument(
+        "--no-carry-detect", action="store_true",
+        help="(v0.5.2) skip the carry-detection pass. Useful for tests.",
     )
     wv.add_argument("--window-hours", type=float, default=2.0,
                     help="±hours around anchor span to pull others (default 2)")
@@ -352,6 +374,14 @@ def _cmd_render(args) -> int:
 
 def _cmd_render_skool(args) -> int:
     """v0.5 — woven jsonl → bubble HTML page(s)."""
+    if getattr(args, "pace", "fast") == "editorial":
+        print(
+            "--pace editorial is reserved for v0.5.3+; only fast is "
+            "implemented. Use --pace fast (default).",
+            file=sys.stderr,
+        )
+        return 2
+
     from transcript_pipeline.skool_renderer import RenderRequest, render_file
 
     missing = [
@@ -624,6 +654,22 @@ def _cmd_weave(args) -> int:
     from transcript_pipeline.woven_jsonl import parsed_to_woven, write_woven
     woven_jsonl_path = out_dir / "skool" / f"{anchor.conversation_id}.woven.jsonl"
     woven_turns = parsed_to_woven(result.merged)
+
+    # ── v0.5.2 — copy-paste carry detection (post-weave, pre-write) ──
+    if not args.no_carry_detect:
+        from transcript_pipeline.carry_detector import detect_carries
+        carry_stats = detect_carries(
+            woven_turns,
+            threshold=args.carry_threshold,
+            embedder_tag=args.embedder_model,
+        )
+        print(
+            f"carry detection: {carry_stats.carries_detected} of "
+            f"{carry_stats.total_adam_turns} ADAM turn(s) flagged as carries "
+            f"(threshold={args.carry_threshold}, partial={carry_stats.partial_carries}, "
+            f"skipped={carry_stats.skipped})"
+        )
+
     write_woven(
         woven_jsonl_path,
         session_id=anchor.conversation_id,
