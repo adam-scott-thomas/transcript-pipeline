@@ -142,7 +142,12 @@ def _parse_surface_table(spec_text: str) -> dict[str, str]:
 
 
 def _parse_tool_recess(spec_text: str) -> tuple[dict[str, str], dict[str, str]]:
-    section = _slice_section(spec_text, "### 4.3 Tool-call recess")
+    # v0.5.2 — heading is "Tool-call terminal chrome"; the recess palette is
+    # the first table under it.
+    section = _slice_section(spec_text, "### 4.3 Tool-call terminal chrome")
+    if not section:
+        # back-compat with older SPEC heading
+        section = _slice_section(spec_text, "### 4.3 Tool-call recess")
     colored: dict[str, str] = {}
     codex: dict[str, str] = {}
     for row in _table_rows(section):
@@ -255,9 +260,37 @@ _RESULT_LINE_RE = re.compile(r"^\s*\[result:\s*(.+?)\]\s*$")
 
 @dataclass
 class Segment:
+    """One slice of a bubble's body. v0.5.2 — tool-call segments now carry
+    structured `tool_type` and `command` so the renderer can emit terminal
+    chrome (prompt char, badge, color split) per SPEC §4.3."""
+
     kind: str  # "prose" | "tool-call" | "code-output"
     text: str
     dwell_ms: int = 0
+    tool_type: str = ""  # "Bash" | "Write" | "Edit" | ... (tool-call only)
+    command: str = ""    # the invocation                  (tool-call only)
+
+
+# Recognized tool types. First whitespace-delimited token after `[tool:` is
+# matched against this list; if it matches we split into (type, command).
+# Anything else falls through as a single-line tool-call with empty type.
+_TOOL_TYPES = {
+    "Bash", "Write", "Edit", "Read", "Grep", "Glob", "WebFetch", "WebSearch",
+    "Task", "Codex", "MCP", "MultiEdit", "NotebookEdit", "Diff",
+}
+
+
+def _split_tool_line(text: str) -> tuple[str, str]:
+    """Pull the leading tool-type token off a `[tool: ...]` body if it
+    matches the known set. Returns (tool_type, command). When no match,
+    tool_type='' and the whole text is the command."""
+    parts = text.split(None, 1)
+    if not parts:
+        return "", ""
+    head, tail = parts[0], (parts[1] if len(parts) > 1 else "")
+    if head in _TOOL_TYPES:
+        return head, tail.strip()
+    return "", text.strip()
 
 
 def parse_segments(body: str, agent: str) -> list[Segment]:
@@ -281,7 +314,14 @@ def parse_segments(body: str, agent: str) -> list[Segment]:
         m_result = _RESULT_LINE_RE.match(line)
         if m_tool:
             flush_prose()
-            segments.append(Segment(kind="tool-call", text=m_tool.group(1).strip()))
+            raw = m_tool.group(1).strip()
+            tool_type, command = _split_tool_line(raw)
+            segments.append(Segment(
+                kind="tool-call",
+                text=raw,
+                tool_type=tool_type,
+                command=command,
+            ))
         elif m_result:
             flush_prose()
             segments.append(Segment(kind="code-output", text=m_result.group(1).strip()))
@@ -299,28 +339,33 @@ def parse_segments(body: str, agent: str) -> list[Segment]:
 # ---------------------------------------------------------------------------
 
 
+# v0.5.2 — fast-pace dwell table per SPEC §4.7. Group-chat pacing, not
+# editorial. Was 4000/2500/1500; now 1500/1000/700.
 _PROSE_DWELL_BY_STAGE = {
-    "Audit": 4000,
-    "Decision": 4000,
-    "Problem": 2500,
-    "Review": 2500,
-    "Ship": 2500,
-    "Context": 1500,
-    "Build": 1500,
-    "Fix": 1500,
-    "Next": 1500,
+    "Decision": 1500,
+    "Ship": 1500,
+    "Audit": 1000,
+    "Review": 1000,
+    "Context": 700,
+    "Problem": 700,
+    "Build": 700,
+    "Fix": 700,
+    "Next": 700,
 }
 _MIN_DWELL_MS = 400
+_REQUIRES_HUMAN_PROSE_BONUS = 400  # was 500
+_TOOL_CALL_FRACTION = 0.50  # was 0.40
+_CODE_OUTPUT_FRACTION = 0.35  # was 0.30
 
 
 def compute_dwell(segment: Segment, *, stage: str, requires_human: bool) -> int:
-    base = _PROSE_DWELL_BY_STAGE.get(stage, 1500)
+    base = _PROSE_DWELL_BY_STAGE.get(stage, 700)
     if segment.kind == "prose":
-        v = base + (500 if requires_human else 0)
+        v = base + (_REQUIRES_HUMAN_PROSE_BONUS if requires_human else 0)
     elif segment.kind == "tool-call":
-        v = int(base * 0.40)
+        v = int(base * _TOOL_CALL_FRACTION)
     elif segment.kind == "code-output":
-        v = int(base * 0.30)
+        v = int(base * _CODE_OUTPUT_FRACTION)
     else:
         v = base
     return max(_MIN_DWELL_MS, v)
@@ -377,29 +422,64 @@ def _outline_class(instance: int) -> str:
     return "outline-4"
 
 
-def _render_segment(seg: Segment, *, kind_class: str, dwell_ms: int, in_codex_bubble: bool) -> str:
-    safe = html_lib.escape(seg.text)
-    classes = f"segment seg-{kind_class}"
-    if seg.kind != "prose" and in_codex_bubble:
-        classes += " seg-recess-codex"
-    elif seg.kind != "prose":
-        classes += " seg-recess-colored"
+def _render_segment(
+    seg: Segment, *, dwell_ms: int, in_codex_bubble: bool
+) -> str:
+    """v0.5.2 — terminal chrome for tool-call cells (prompt char + badge +
+    color split + hang-indent for multi-line commands). Recess palette
+    inverts inside CODEX bubbles per SPEC §4.3."""
     if seg.kind == "prose":
-        # marked.js renders this client-side
+        safe = html_lib.escape(seg.text)
         return (
-            f'<div class="{classes}" data-dwell-ms="{dwell_ms}" data-md="1">'
-            f'{safe}</div>'
+            f'<div class="segment seg-prose" data-dwell-ms="{dwell_ms}" '
+            f'data-md="1">{safe}</div>'
         )
+
+    recess_class = "seg-recess-codex" if in_codex_bubble else "seg-recess-colored"
+
+    if seg.kind == "tool-call":
+        # terminal chrome: $ prompt + badge + colored command
+        badge = ""
+        if seg.tool_type:
+            badge = (
+                f'<span class="tool-badge">{html_lib.escape(seg.tool_type.upper())}</span>'
+            )
+        cmd = seg.command if seg.command else seg.text
+        return (
+            f'<div class="segment seg-tool {recess_class}" '
+            f'data-dwell-ms="{dwell_ms}">{badge}'
+            f'<span class="prompt">$</span>'
+            f'<span class="cmd">{html_lib.escape(cmd)}</span>'
+            f'</div>'
+        )
+
+    # code-output
     return (
-        f'<div class="{classes}" data-dwell-ms="{dwell_ms}">'
-        f'{safe}</div>'
+        f'<div class="segment seg-output {recess_class}" '
+        f'data-dwell-ms="{dwell_ms}">'
+        f'<span class="output">{html_lib.escape(seg.text)}</span>'
+        f'</div>'
     )
 
 
+def _carry_indicator_html(carried_to: list[str]) -> str:
+    if not carried_to:
+        return ""
+    chips: list[str] = []
+    for agent in carried_to:
+        abbrev = _AGENT_INITIALS.get(agent, agent[:2])
+        chips.append(
+            f'<span class="carry-chip">👍 → {html_lib.escape(abbrev)}</span>'
+        )
+    return f'<div class="carry-indicators">{"".join(chips)}</div>'
+
+
 def _render_bubble(turn: WovenTurn) -> str:
+    """v0.5.2 — no avatar circle, no side-rail wrapping. Bubble row only.
+    Carry-tagged ADAM bubbles are filtered upstream and never reach this
+    function; source bubbles with non-empty carried_to render the indicator."""
     is_right = turn.agent == "ADAM"
     row_class = "row right" if is_right else "row"
-    initials = _AGENT_INITIALS.get(turn.agent, turn.agent[:2])
     role = _format_role(turn)
     timestamp = _format_timestamp(turn)
     instance_suffix = "" if turn.instance <= 1 else f" #{turn.instance}"
@@ -413,14 +493,13 @@ def _render_bubble(turn: WovenTurn) -> str:
             "low-confidence" if turn.requires_human else "",
         ] if c
     )
-    avatar_classes = f"avatar avatar-{turn.agent.lower().replace('-', '_')}"
 
     segments = parse_segments(turn.body, turn.agent)
     seg_html: list[str] = []
     for s in segments:
         d = compute_dwell(s, stage=turn.stage, requires_human=turn.requires_human)
         seg_html.append(
-            _render_segment(s, kind_class=s.kind, dwell_ms=d, in_codex_bubble=in_codex)
+            _render_segment(s, dwell_ms=d, in_codex_bubble=in_codex)
         )
 
     head = (
@@ -431,64 +510,37 @@ def _render_bubble(turn: WovenTurn) -> str:
         '</div>'
     )
 
+    carry_html = _carry_indicator_html(turn.carried_to)
+
     bubble = (
         f'<div class="{bubble_classes}">'
         f'{head}'
         '<div class="body">'
         f'{"".join(seg_html)}'
         '</div>'
+        f'{carry_html}'
         '</div>'
     )
 
     chapter_attr = f'data-chapter="{turn.chapter}"'
     return (
-        f'<div class="{row_class}" {chapter_attr}>'
-        f'<div class="{avatar_classes}">{html_lib.escape(initials)}</div>'
-        f'<div class="bubble-wrap">{bubble}</div>'
-        '</div>'
+        f'<div class="{row_class}" {chapter_attr}>{bubble}</div>'
     )
 
 
-def _render_chapter_rail(turns: list[WovenTurn]) -> str:
-    seen: dict[int, tuple[str, str]] = {}
-    order: list[int] = []
-    for t in turns:
-        if t.chapter not in seen:
-            seen[t.chapter] = (t.stage, t.chapter_outcome)
-            order.append(t.chapter)
-    parts = ['<nav class="chapter-rail">']
-    for n in order:
-        stage, outcome = seen[n]
-        text = f"[CHAPTER {n:02d}] {stage}"
-        if outcome:
-            text += f" — {outcome}"
-        parts.append(
-            f'<div class="chapter-marker" data-chapter="{n}">'
-            f'<span class="chapter-num">{n:02d}</span>'
-            f'<span class="chapter-text">{html_lib.escape(text)}</span>'
-            f'</div>'
-        )
-    parts.append("</nav>")
-    return "".join(parts)
-
-
-def _render_metadata(turns: list[WovenTurn]) -> str:
-    n_low = sum(1 for t in turns if t.requires_human)
+def _render_inline_divider(turn: WovenTurn) -> str:
+    """v0.5.2 — chapter changes render INLINE between bubbles, not in a
+    side rail. First chapter (the title bar already frames it) is
+    suppressed by the caller, not here."""
+    text = f"[CHAPTER {turn.chapter:02d}] {turn.stage}"
+    if turn.chapter_outcome:
+        text += f" — {turn.chapter_outcome}"
     return (
-        '<aside class="metadata">'
-        '<div class="meta-block">'
-        '<div class="meta-label">turns</div>'
-        f'<div class="meta-value">{len(turns)}</div>'
-        '</div>'
-        '<div class="meta-block">'
-        '<div class="meta-label">low-confidence</div>'
-        f'<div class="meta-value">{n_low}</div>'
-        '</div>'
-        '<div class="meta-block">'
-        '<div class="meta-label">version</div>'
-        '<div class="meta-value">v1.0</div>'
-        '</div>'
-        '</aside>'
+        f'<div class="chapter-divider" data-chapter="{turn.chapter}">'
+        f'<span class="rule"></span>'
+        f'<span class="marker">{html_lib.escape(text)}</span>'
+        f'<span class="rule"></span>'
+        f'</div>'
     )
 
 
@@ -540,22 +592,21 @@ body {{
   font-family: 'JetBrains Mono', ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }}
 
-/* ── 16:9 grid ── */
+/* ── v0.5.2 layout: 16:9, slim title, no rails, no avatars ── */
 .frame {{
   width: 1920px; min-height: 1080px;
   display: grid;
-  grid-template-rows: 80px 1fr;
-  grid-template-columns: 240px 1440px 240px;
+  grid-template-rows: 56px 1fr;
+  grid-template-columns: 1fr;
   background: var(--bg);
   margin: 0 auto;
 }}
 .title-bar {{
-  grid-column: 1 / -1;
-  display: flex; align-items: center; gap: 16px;
+  display: flex; align-items: center; gap: 14px;
   padding: 0 28px;
   border-bottom: 1px solid var(--rule);
   font-family: 'Instrument Serif', ui-serif, Georgia, serif;
-  font-size: 36px;
+  font-size: 26px;
   letter-spacing: -0.01em;
 }}
 .title-bar .code {{ color: var(--ink); }}
@@ -563,95 +614,58 @@ body {{
 .title-bar .status {{ color: var(--ink); }}
 .title-bar .outcome {{ color: var(--ink-dim); }}
 .title-bar .part-tag {{
-  margin-left: auto; font-size: 18px;
-  padding: 4px 10px; border: 1px solid var(--rule); border-radius: 999px;
+  margin-left: auto; font-size: 14px;
+  padding: 3px 10px; border: 1px solid var(--rule); border-radius: 999px;
   color: var(--ink-dim);
   font-family: ui-monospace, Menlo, Consolas, monospace;
-}}
-
-.chapter-rail {{
-  border-right: 1px solid var(--rule);
-  padding: 24px 14px;
-  overflow-y: auto;
-}}
-.chapter-marker {{
-  display: flex; gap: 8px; align-items: flex-start;
-  padding: 10px 8px; margin-bottom: 4px;
-  border-radius: 8px;
-  font-size: 18px;
-  color: var(--ink-dim);
-}}
-.chapter-marker.active {{ background: var(--container-bg); color: var(--ink); }}
-.chapter-marker .chapter-num {{
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 16px;
-  opacity: 0.7;
-}}
-.chapter-marker .chapter-text {{
-  flex: 1;
-  font-family: 'Instrument Serif', ui-serif, Georgia, serif;
-  font-size: 20px;
-  line-height: 1.3;
 }}
 
 .main {{
-  padding: 24px 32px 80px;
+  padding: 24px 80px 80px;
   background: var(--bg);
   overflow-y: auto;
 }}
 .transcript {{
-  background: var(--container-bg);
-  border: 1px solid var(--rule);
-  border-radius: 18px;
-  padding: 24px;
-  display: flex; flex-direction: column; gap: 18px;
+  display: flex; flex-direction: column; gap: 0;
+  width: 100%;
+  max-width: none;
 }}
 
-.row {{ display: flex; gap: 12px; align-items: flex-end; }}
-.row.right {{ flex-direction: row-reverse; }}
-
-.avatar {{
-  width: 36px; height: 36px;
-  border-radius: 50%;
-  display: grid; place-items: center;
-  font-size: 12px; font-weight: 700; letter-spacing: 0.04em;
-  border: 1px solid var(--rule);
-  flex: none;
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-}}
-.bubble-wrap {{ flex: 1; min-width: 0; max-width: 1100px; }}
+.row {{ display: flex; margin: 10px 0; }}
+.row.right {{ justify-content: flex-end; }}
 
 .bubble {{
   padding: 14px 18px;
   border-radius: 18px;
-  max-width: 1100px;
+  max-width: 1400px;
   word-wrap: break-word;
+  position: relative;
 }}
-.bubble.outline-2 {{ box-shadow: 0 0 0 1px #ffffff, 0 8px 24px -16px rgba(0,0,0,0.4); }}
-.bubble.outline-3 {{ box-shadow: 0 0 0 1px #ffffff, 0 0 0 4px transparent, 0 0 0 5px #ffffff; }}
+.bubble.outline-2 {{ box-shadow: 0 0 0 2px #ffffff, 0 8px 24px -16px rgba(0,0,0,0.4); }}
+.bubble.outline-3 {{ box-shadow: 0 0 0 2px #ffffff, 0 0 0 6px var(--bg), 0 0 0 8px #ffffff; }}
 .bubble.outline-4 {{
   box-shadow:
-    0 0 0 1px #ffffff,
-    0 0 0 4px transparent,
-    0 0 0 5px #ffffff,
-    0 0 0 8px transparent,
-    0 0 0 9px #ffffff;
+    0 0 0 2px #ffffff,
+    0 0 0 6px var(--bg),
+    0 0 0 8px #ffffff,
+    0 0 0 12px var(--bg),
+    0 0 0 14px #ffffff;
 }}
-.bubble.low-confidence {{ outline: 1px dashed currentColor; outline-offset: 2px; }}
+.bubble.low-confidence {{ outline: 2px dashed #FFD84A; outline-offset: 3px; }}
 
 .bubble .head {{
   display: flex; gap: 10px; align-items: baseline;
-  margin-bottom: 8px;
-  font-size: 20px;
+  margin-bottom: 6px;
+  font-size: 18px;
   letter-spacing: 0.04em;
 }}
 .bubble .speaker {{
   font-family: 'Instrument Serif', ui-serif, Georgia, serif;
   font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
-  font-size: 28px;
+  font-size: 26px;
 }}
 .bubble .role {{
-  font-size: 18px;
+  font-size: 14px;
   opacity: 0.78;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -663,35 +677,98 @@ body {{
 .bubble .ts {{
   margin-left: auto;
   font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 18px;
+  font-size: 14px;
   opacity: 0.6;
 }}
 
-.bubble .body {{ display: flex; flex-direction: column; gap: 8px; }}
+.bubble .body {{ display: flex; flex-direction: column; gap: 6px; }}
 .segment {{ font-size: 22px; line-height: 1.5; }}
 .segment.seg-prose {{ white-space: pre-wrap; }}
 
+/* ── v0.5.2 inline chapter divider ── */
+.chapter-divider {{
+  display: flex; align-items: center; gap: 12px;
+  margin: 20px 0 10px;
+}}
+.chapter-divider .rule {{
+  flex: 1; height: 1px; background: var(--rule);
+}}
+.chapter-divider .marker {{
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 14px; color: var(--ink-dim);
+  letter-spacing: 0.04em;
+}}
+
+/* ── v0.5.2 terminal chrome on tool-call cells ── */
 .seg-recess-colored {{
   background: {tc.get('bg', '#000000')};
   color: {tc.get('fg', '#5A626F')};
   border: 1px solid {tc.get('border', '#1A1A1A')};
-  border-radius: 8px;
-  padding: 8px 12px;
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 18px;
-  white-space: pre-wrap;
-  overflow-x: auto;
 }}
 .seg-recess-codex {{
   background: {tcx.get('bg', '#EBEBEB')};
   color: {tcx.get('fg', '#B5B5B5')};
   border: 1px solid {tcx.get('border', '#D4D4D4')};
+}}
+.seg-tool, .seg-output {{
   border-radius: 8px;
   padding: 8px 12px;
   font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 18px;
-  white-space: pre-wrap;
+  font-size: 16px;
+  margin: 10px 0;
+  position: relative;
   overflow-x: auto;
+}}
+.seg-tool .prompt {{
+  display: inline-block;
+  width: 16px;
+  color: inherit;          /* recess.fg */
+  font-weight: 600;
+  user-select: none;
+  margin-right: 6px;
+}}
+.seg-tool .cmd {{
+  color: var(--ink);
+  font-weight: 500;
+  white-space: pre-wrap;
+  /* hang-indent: when a long command wraps, lines align under the $ */
+  display: inline;
+  padding-left: 0;
+}}
+.bubble.agent-codex .seg-tool .cmd {{
+  color: #0B0D11;          /* dark text inside the white CODEX bubble */
+}}
+.seg-tool .tool-badge {{
+  position: absolute;
+  top: 6px; right: 10px;
+  font-size: 10px; letter-spacing: 0.10em;
+  color: #3A4250;
+  text-transform: uppercase;
+  user-select: none;
+}}
+.bubble.agent-codex .seg-tool .tool-badge {{
+  color: #B5B5B5;
+}}
+.seg-output {{
+  white-space: pre-wrap;
+  font-weight: 400;
+}}
+.seg-output .output {{ color: inherit; }}
+
+/* ── v0.5.2 carry indicator ── */
+.carry-indicators {{
+  display: flex; gap: 8px; flex-wrap: wrap;
+  position: absolute;
+  bottom: -10px; right: 14px;
+}}
+.carry-chip {{
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 14px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--rule);
+  color: var(--ink-dim);
 }}
 
 pre {{ max-height: 400px; overflow: hidden; position: relative; margin: 0; }}
@@ -702,25 +779,6 @@ pre::after {{
   pointer-events: none;
 }}
 code.hljs {{ background: transparent; }}
-
-.metadata {{
-  border-left: 1px solid var(--rule);
-  padding: 24px 18px;
-  display: flex; flex-direction: column; gap: 18px;
-  font-size: 18px;
-}}
-.meta-block .meta-label {{
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  font-size: 14px;
-  color: var(--ink-muted);
-}}
-.meta-block .meta-value {{
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 24px;
-  color: var(--ink);
-  margin-top: 4px;
-}}
 
 /* per-agent palette (parsed from SPEC.md) */
 {"".join(agent_rules)}
@@ -775,15 +833,26 @@ def _render_page(
     part_num: int,
     total_parts: int,
 ) -> str:
+    """v0.5.2 — no rails, no metadata strip, no avatars. Inline chapter
+    dividers between bubbles; carry-tagged ADAM bubbles skipped."""
     css = _build_css(palette)
     title = f"{project_code} — {status} — {outcome}"
+
     body_html: list[str] = []
     last_chapter = -1
     for t in turns:
+        # v0.5.2 — skip carry-tagged ADAM bubbles entirely. The source
+        # bubble already said this; the indicator on the source carries
+        # the cross-paste signal.
+        if t.is_carry and t.agent == "ADAM":
+            continue
+        # inline chapter divider on chapter change (suppress before first
+        # non-skipped turn — the title bar frames chapter 01)
+        if last_chapter != -1 and t.chapter != last_chapter:
+            body_html.append(_render_inline_divider(t))
+        last_chapter = t.chapter
         body_html.append(_render_bubble(t))
 
-    chapter_rail = _render_chapter_rail(turns)
-    metadata = _render_metadata(turns)
     part_tag = (
         f"part {part_num:02d} / {total_parts:02d}"
         if total_parts > 1 else "single"
@@ -798,7 +867,7 @@ def _render_page(
 <title>{html_lib.escape(title)}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/atom-one-dark.min.css">
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
@@ -815,13 +884,11 @@ def _render_page(
     <span class="outcome">{html_lib.escape(outcome)}</span>
     <span class="part-tag">{html_lib.escape(part_tag)}</span>
   </div>
-  {chapter_rail}
   <main class="main">
     <div class="transcript">
       {"".join(body_html)}
     </div>
   </main>
-  {metadata}
 </div>
 <script>
   // Markdown rendering pass over .seg-prose blocks. We keep raw text in the
@@ -834,23 +901,6 @@ def _render_page(
   document.querySelectorAll('pre code').forEach((el) => {{
     try {{ hljs.highlightElement(el); }} catch (e) {{}}
   }});
-  // Active-chapter highlight: scroll-link the rail markers to the row in view.
-  const rail = document.querySelectorAll('.chapter-marker');
-  const rows = document.querySelectorAll('.row[data-chapter]');
-  function syncActive() {{
-    const yMid = window.scrollY + window.innerHeight / 2;
-    let bestChap = null, bestDist = Infinity;
-    rows.forEach((r) => {{
-      const t = r.getBoundingClientRect().top + window.scrollY;
-      const d = Math.abs(t - yMid);
-      if (d < bestDist) {{ bestDist = d; bestChap = r.getAttribute('data-chapter'); }}
-    }});
-    rail.forEach((m) => {{
-      m.classList.toggle('active', m.getAttribute('data-chapter') === bestChap);
-    }});
-  }}
-  window.addEventListener('scroll', syncActive, {{ passive: true }});
-  syncActive();
 </script>
 </body>
 </html>"""
