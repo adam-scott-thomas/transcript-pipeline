@@ -29,7 +29,7 @@ from transcript_pipeline.schema import (  # re-export for ergonomics
 )
 from transcript_pipeline.runtime import boot, get_core
 
-__version__ = "0.5.0"
+__version__ = "0.5.2"
 __all__ = [
     "Agent",
     "Stage",
